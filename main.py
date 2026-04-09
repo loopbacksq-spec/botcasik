@@ -106,9 +106,10 @@ async def clean_old_transfers():
 # --- КЛАВИАТУРЫ ---
 def get_main_keyboard():
     builder = ReplyKeyboardBuilder()
-    # Важно: эмодзи должны быть точно такими же, как в обработчиках
+    # Используем точные эмодзи
     builder.row(KeyboardButton(text="Рыбалка 🎣"), KeyboardButton(text="КнБ ✊✌️✋"))
     builder.row(KeyboardButton(text="Баланс 💰"), KeyboardButton(text="Перевод 💸"))
+    builder.row(KeyboardButton(text="🔄 Сброс / Reset")) # Кнопка для экстренного сброса
     return builder.as_markup(resize_keyboard=True)
 
 def get_yes_no_keyboard():
@@ -139,7 +140,7 @@ def get_transfer_choice_keyboard():
 
 # --- ОБРАБОТЧИКИ ---
 
-@dp.message(Command("start"))
+@dp.message(Command("start") | F.text.contains("/start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     await clean_old_transfers()
@@ -157,11 +158,10 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     await message.answer("КнБ легальное только у нас!", reply_markup=get_main_keyboard())
 
-# Команда для сброса зависаний
-@dp.message(Command("reset"))
+@dp.message(F.text.contains("сброс") | F.text.contains("Reset") | Command("reset"))
 async def cmd_reset(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Состояние сброшено.", reply_markup=get_main_keyboard())
+    await message.answer("✅ Состояние сброшено. Меню обновлено.", reply_markup=get_main_keyboard())
 
 @dp.callback_query(F.data.in_(["perm_yes", "perm_no"]))
 async def process_permission(callback: types.CallbackQuery, state: FSMContext):
@@ -170,33 +170,55 @@ async def process_permission(callback: types.CallbackQuery, state: FSMContext):
     await callback.message.edit_text("Настройка сохранена.")
     await callback.message.answer("КнБ легальное только у нас!", reply_markup=get_main_keyboard())
 
+# --- ИСПРАВЛЕННЫЕ КНОПКИ МЕНЮ ---
+# Используем F.text.startswith или contains для надежности, но лучше точное совпадение, если эмодзи верные.
+# Добавим обработку на случай, если пользователь нажал кнопку, но бот не понял.
+
 @dp.message(F.text == "Рыбалка 🎣")
 async def cmd_fishing(message: types.Message):
     logger.info(f"User {message.from_user.id} clicked Fishing")
+    await message.answer("Лови первые свои деньги!", reply_markup=get_fish_keyboard())
+
+@dp.message(F.text == "Баланс 💰")
+async def cmd_balance(message: types.Message):
+    logger.info(f"User {message.from_user.id} checked balance")
     user = await get_user(message.from_user.id)
-    if not user: return
-    
+    if user:
+        await message.answer(f"💳 Ваш баланс: <b>{user[2]}</b> рублей.", parse_mode="HTML")
+    else:
+        await message.answer("Ошибка пользователя.")
+
+@dp.message(F.text == "КнБ ✊✌️✋")
+async def cmd_knb_start(message: types.Message, state: FSMContext):
+    logger.info(f"User {message.from_user.id} started KNB")
+    await state.set_state(Form.waiting_for_bet)
+    await message.answer("Введите ставку (число). Для отмены напишите 'отмена'.")
+
+@dp.message(F.text == "Перевод 💸")
+async def cmd_transfer_menu(message: types.Message):
+    logger.info(f"User {message.from_user.id} opened transfer menu")
+    await message.answer("Выберите действие:", reply_markup=get_transfer_choice_keyboard())
+
+# --- РЫБАЛКА ЛОГИКА ---
+@dp.callback_query(F.data == "fish_catch")
+async def process_fishing(callback: types.CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    if not user:
+        await callback.answer("Ошибка пользователя", show_alert=True)
+        return
+
     current_time = time.time()
     last_fish = user[4] 
     
+    # Кулдаун 1 час (3600 сек)
     if current_time - last_fish < 3600:
         remaining = int(3600 - (current_time - last_fish))
         mins = remaining // 60
         secs = remaining % 60
-        await message.answer(f"Вы уже ловили рыбу! Следующая попытка через {mins} мин {secs} сек.")
+        await callback.answer(f"⏳ Рыба клюнет только через {mins} мин {secs} сек!", show_alert=True)
         return
 
-    await message.answer("Лови первые свои деньги!", reply_markup=get_fish_keyboard())
-
-@dp.callback_query(F.data == "fish_catch")
-async def process_fishing(callback: types.CallbackQuery):
-    user = await get_user(callback.from_user.id)
-    current_time = time.time()
-    
-    if current_time - user[4] < 3600:
-        await callback.answer("Кулдаун еще не прошел!", show_alert=True)
-        return
-
+    # Шансы
     prizes = [
         (0, 3), (5, 10), (15, 30), (33, 25), (45, 30),
         (60, 21), (20, 40), (26, 50), (100, 2), (500, 0.5)
@@ -217,20 +239,15 @@ async def process_fishing(callback: types.CallbackQuery):
     await update_balance(callback.from_user.id, won_amount)
     await update_last_fish_time(callback.from_user.id, current_time)
     
-    await callback.message.edit_text(f"🎣 Вы поймали: {won_amount} рублей!")
+    await callback.message.edit_text(f"🎣 Улов: <b>{won_amount}</b> рублей!", parse_mode="HTML")
     await callback.answer()
 
-@dp.message(F.text == "КнБ ✊✌️✋")
-async def cmd_knb_start(message: types.Message, state: FSMContext):
-    logger.info(f"User {message.from_user.id} started KNB")
-    await state.set_state(Form.waiting_for_bet)
-    await message.answer("Введите ставку (минимум 1 рубль). Для отмены напишите 'отмена'.")
-
+# --- КНБ ЛОГИКА ---
 @dp.message(Form.waiting_for_bet)
 async def process_bet_input(message: types.Message, state: FSMContext):
     text = message.text.strip().lower()
     
-    if text in ["отмена", "cancel", "назад"]:
+    if text in ["отмена", "cancel", "назад", "меню"]:
         await state.clear()
         await message.answer("Действие отменено.", reply_markup=get_main_keyboard())
         return
@@ -239,17 +256,17 @@ async def process_bet_input(message: types.Message, state: FSMContext):
         bet = int(text)
         if bet < 1: raise ValueError
     except ValueError:
-        await message.answer("Ставка должна быть целым числом больше 0. Попробуйте еще раз или напишите 'отмена'.")
+        await message.answer("❌ Ставка должна быть числом больше 0. Попробуйте еще раз.")
         return
 
     user = await get_user(message.from_user.id)
-    if user[2] < bet:
-        await message.answer(f"Недостаточно средств. Ваш баланс: {user[2]} руб.")
+    if not user or user[2] < bet:
+        await message.answer(f"❌ Недостаточно средств. Баланс: {user[2] if user else 0} руб.")
         return
 
     await update_balance(message.from_user.id, -bet)
     await state.update_data(bet=bet)
-    await message.answer("Сделайте ваш выбор:", reply_markup=get_game_keyboard())
+    await message.answer("Выбери:", reply_markup=get_game_keyboard())
 
 @dp.callback_query(F.data.startswith("game_"), Form.waiting_for_bet)
 async def process_game_choice(callback: types.CallbackQuery, state: FSMContext):
@@ -264,15 +281,15 @@ async def process_game_choice(callback: types.CallbackQuery, state: FSMContext):
     multiplier = 0
     
     if user_choice == bot_choice:
-        result = "Ничья!"
+        result = "Ничья! 🤝"
         multiplier = 1
     elif (user_choice == "rock" and bot_choice == "scissors") or \
          (user_choice == "scissors" and bot_choice == "paper") or \
          (user_choice == "paper" and bot_choice == "rock"):
-        result = "Вы победили!"
+        result = "Победа! 🎉"
         multiplier = 2
     else:
-        result = "Бот победил!"
+        result = "Проигрыш! 😢"
         multiplier = 0
 
     win_amount = bet * multiplier
@@ -281,7 +298,7 @@ async def process_game_choice(callback: types.CallbackQuery, state: FSMContext):
 
     ru_map = {"rock": "Камень ✊", "scissors": "Ножницы ✌️", "paper": "Бумага ✋"}
     
-    text_res = f"Вы: {ru_map[user_choice]}\nБот: {ru_map[bot_choice]}\n\n{result}\nИзменение баланса: {win_amount - bet if multiplier != 1 else 0} (Ставка: {bet})"
+    text_res = f"Вы: {ru_map[user_choice]}\nБот: {ru_map[bot_choice]}\n\n{result}\nСтавка: {bet} | Выигрыш: {win_amount}"
     
     await callback.message.edit_text(text_res)
     await state.clear()
@@ -293,25 +310,14 @@ async def cancel_game(callback: types.CallbackQuery, state: FSMContext):
     bet = data['bet']
     await update_balance(callback.from_user.id, bet)
     await state.clear()
-    await callback.message.edit_text("Игра отменена. Ставка возвращена.")
+    await callback.message.edit_text("Игра отменена. Деньги возвращены.")
     await callback.answer()
 
-@dp.message(F.text == "Баланс 💰")
-async def cmd_balance(message: types.Message):
-    logger.info(f"User {message.from_user.id} checked balance")
-    user = await get_user(message.from_user.id)
-    if user:
-        await message.answer(f"Ваш баланс: {user[2]} рублей.")
-
-@dp.message(F.text == "Перевод 💸")
-async def cmd_transfer_menu(message: types.Message):
-    logger.info(f"User {message.from_user.id} opened transfer menu")
-    await message.answer("Выберите действие:", reply_markup=get_transfer_choice_keyboard())
-
+# --- ПЕРЕВОДЫ ---
 @dp.callback_query(F.data == "trans_send")
 async def start_send_transfer(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_transfer_amount)
-    await callback.message.edit_text("Введите сумму для перевода. Для отмены: 'отмена'")
+    await callback.message.edit_text("Введите сумму перевода:")
 
 @dp.message(Form.waiting_for_transfer_amount)
 async def process_transfer_amount(message: types.Message, state: FSMContext):
@@ -325,12 +331,12 @@ async def process_transfer_amount(message: types.Message, state: FSMContext):
         amount = int(text)
         if amount < 1: raise ValueError
     except ValueError:
-        await message.answer("Введите корректную сумму (целое число > 0).")
+        await message.answer("Введите число.")
         return
         
     user = await get_user(message.from_user.id)
     if user[2] < amount:
-        await message.answer("Недостаточно средств.")
+        await message.answer("Мало денег.")
         return
         
     await update_balance(message.from_user.id, -amount)
@@ -338,12 +344,12 @@ async def process_transfer_amount(message: types.Message, state: FSMContext):
     await add_transfer_code(code, message.from_user.id, amount)
     
     await state.clear()
-    await message.answer(f"✅ Средства заморожены.\nВаш код получения: <code>{code}</code>\nОтправьте этот код получателю. Код действителен 5 минут.", parse_mode="HTML", reply_markup=get_main_keyboard())
+    await message.answer(f"Код: <code>{code}</code>\nОтдай его другу.", parse_mode="HTML", reply_markup=get_main_keyboard())
 
 @dp.callback_query(F.data == "trans_receive")
 async def start_receive_transfer(callback: types.CallbackQuery, state: FSMContext):
     await state.set_state(Form.waiting_for_receive_code)
-    await callback.message.edit_text("Введите код получения денег. Для отмены: 'отмена'")
+    await callback.message.edit_text("Введите код:")
 
 @dp.message(Form.waiting_for_receive_code)
 async def process_receive_code(message: types.Message, state: FSMContext):
@@ -353,38 +359,33 @@ async def process_receive_code(message: types.Message, state: FSMContext):
         await message.answer("Отменено.", reply_markup=get_main_keyboard())
         return
     
-    if len(text) != 5 or not text.isdigit():
-        await message.answer("Код должен состоять из 5 цифр.")
-        return
-        
     transfer_data = await get_and_delete_transfer_code(text)
     
-    if not transfer_data:
-        await message.answer("❌ Неверный код или срок действия истек.")
+    if not transfer_
+        await message.answer("Неверный код.")
     else:
         sender_id, amount, created_at = transfer_data
         if time.time() - created_at > 300:
-             await message.answer("❌ Срок действия кода истек.")
+             await message.answer("Код протух.")
         else:
             await update_balance(message.from_user.id, amount)
-            await message.answer(f"✅ Вы получили {amount} рублей!", reply_markup=get_main_keyboard())
+            await message.answer(f"Получено {amount} руб!", reply_markup=get_main_keyboard())
             
     await state.clear()
 
 @dp.callback_query(F.data == "back_menu")
 async def back_to_menu(callback: types.CallbackQuery, state: FSMContext):
     await state.clear()
-    await callback.message.edit_text("КнБ легальное только у нас!", reply_markup=get_main_keyboard())
+    await callback.message.edit_text("Меню:", reply_markup=get_main_keyboard())
 
 # --- ЗАПУСК ---
 async def main():
     await init_db()
     logger.info("Bot started...")
-    # drop_pending_updates=True поможет избежать шквала старых сообщений при рестарте
     await dp.start_polling(bot, drop_pending_updates=True)
 
 if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+        logger.info("Bot stopped")
